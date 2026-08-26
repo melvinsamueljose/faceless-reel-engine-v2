@@ -26,13 +26,11 @@ def build_synced_audio(vo_timeline, output_final_audio="final_synced_vo.mp3"):
             
         part_filename = f"vo_part_{i}.mp3"
         
-        # Try generating TTS audio
         tts_cmd = ["edge-tts", "--text", text, "--write-media", part_filename, "--voice", "en-US-ChristopherNeural"]
         try:
             subprocess.run(tts_cmd, check=True)
         except Exception as err:
             print(f"[STAGE 2 WARNING] Edge-TTS failed for segment {i}: {err}. Creating fallback silent audio.")
-            # Create a 1-second silent audio clip if TTS fails
             subprocess.run([
                 "ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono", 
                 "-t", "1", "-c:a", "libmp3lame", part_filename
@@ -45,7 +43,6 @@ def build_synced_audio(vo_timeline, output_final_audio="final_synced_vo.mp3"):
         print("[STAGE 2 ERROR] No audio clips could be generated.")
         sys.exit(1)
 
-    # Build FFmpeg command to combine clips with proper timing delays
     inputs = []
     filter_complex_parts = []
     
@@ -72,13 +69,18 @@ def render_hyperframes():
     downloaded_images = [f for f in os.listdir('.') if f.startswith('image_') and f.endswith('.jpg')]
     
     if downloaded_images:
-        print(f"[STAGE 2] Stitching {len(downloaded_images)} screenshots with FFmpeg engine...")
+        print(f"[STAGE 2] Stitching {len(downloaded_images)} screenshots with standardized 1080x1920 scaling...")
         inputs = []
-        for img in sorted(downloaded_images):
-            inputs.extend(["-loop", "1", "-t", "3", "-i", img])
+        filter_prep = []
+        concat_str = ""
         
-        concat_str = "".join([f"[{i}:v]" for i in range(len(downloaded_images))])
-        filter_str = f"{concat_str}concat=n={len(downloaded_images)}:v=1:a=0[v]"
+        for i, img in enumerate(sorted(downloaded_images)):
+            inputs.extend(["-loop", "1", "-t", "3", "-i", img])
+            # Force uniform resolution (1080x1920) with black padding to handle varying screenshot sizes
+            filter_prep.append(f"[{i}:v]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1[v{i}]")
+            concat_str += f"[v{i}]"
+        
+        filter_str = ";".join(filter_prep) + f";{concat_str}concat=n={len(downloaded_images)}:v=1:a=0[v]"
         
         ffmpeg_cmd = ["ffmpeg", "-y"] + inputs + [
             "-i", "final_synced_vo.mp3",
@@ -90,7 +92,6 @@ def render_hyperframes():
         print("[STAGE 2] Video stitched successfully: final_reel.mp4")
     else:
         print("[STAGE 2 WARNING] No custom images found. Running default video pipeline...")
-        # Create a basic blank video with the audio if no images exist
         ffmpeg_cmd = [
             "ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=black:s=1080x1920:r=30",
             "-i", "final_synced_vo.mp3", "-c:v", "libx264", "-c:a", "aac",
