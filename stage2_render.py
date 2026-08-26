@@ -16,8 +16,7 @@ def clean_token(token_str):
 def build_synced_audio(vo_timeline, output_final_audio="final_synced_vo.mp3"):
     print("[STAGE 2] Generating Edge-TTS clips and applying timestamp delays...")
     
-    inputs = []
-    filter_complex_parts = []
+    valid_clips = []
     
     for i, item in enumerate(vo_timeline):
         start_ms = int(item["start_sec"] * 1000)
@@ -27,28 +26,45 @@ def build_synced_audio(vo_timeline, output_final_audio="final_synced_vo.mp3"):
             
         part_filename = f"vo_part_{i}.mp3"
         
+        # Try generating TTS audio
         tts_cmd = ["edge-tts", "--text", text, "--write-media", part_filename, "--voice", "en-US-ChristopherNeural"]
         try:
             subprocess.run(tts_cmd, check=True)
         except Exception as err:
-            print(f"[STAGE 2 ERROR] Edge-TTS failed for segment {i}: {err}")
-            subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono", "-t", "1", part_filename], check=True)
+            print(f"[STAGE 2 WARNING] Edge-TTS failed for segment {i}: {err}. Creating fallback silent audio.")
+            # Create a 1-second silent audio clip if TTS fails
+            subprocess.run([
+                "ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono", 
+                "-t", "1", "-c:a", "libmp3lame", part_filename
+            ], check=True)
         
-        inputs.extend(["-i", part_filename])
-        filter_complex_parts.append(f"[{i}:a]adelay={start_ms}|{start_ms}[a{i}]")
+        if os.path.exists(part_filename):
+            valid_clips.append((part_filename, start_ms))
 
-    concat_inputs = "".join([f"[a{i}]" for i in range(len(vo_timeline))])
-    filter_complex = ";".join(filter_complex_parts) + f";{concat_inputs}amix=inputs={len(vo_timeline)}:normalize=0[aout]"
+    if not valid_clips:
+        print("[STAGE 2 ERROR] No audio clips could be generated.")
+        sys.exit(1)
+
+    # Build FFmpeg command to combine clips with proper timing delays
+    inputs = []
+    filter_complex_parts = []
     
-    ffmpeg_cmd = ["ffmpeg", "-y"] + inputs + ["-filter_complex", filter_complex, "-map", "[aout]", output_final_audio]
+    for idx, (filename, delay) in enumerate(valid_clips):
+        inputs.extend(["-i", filename])
+        filter_complex_parts.append(f"[{idx}:a]adelay={delay}|{delay}[a{idx}]")
+
+    concat_inputs = "".join([f"[a{idx}]" for idx in range(len(valid_clips))])
+    filter_complex = ";".join(filter_complex_parts) + f";{concat_inputs}amix=inputs={len(valid_clips)}:normalize=0[aout]"
+    
+    ffmpeg_cmd = ["ffmpeg", "-y"] + inputs + ["-filter_complex", filter_complex, "-map", "[aout]", "-c:a", "libmp3lame", output_final_audio]
     
     try:
         subprocess.run(ffmpeg_cmd, check=True)
-        print(f"[STAGE 2] Synced audio generated: {output_final_audio}")
+        print(f"[STAGE 2] Synced audio generated successfully: {output_final_audio}")
     except subprocess.CalledProcessError as e:
-        print(f"[STAGE 2 WARNING] Multi-clip audio mix failed ({e}). Falling back to primary segment.")
-        if os.path.exists("vo_part_0.mp3"):
-            os.rename("vo_part_0.mp3", output_final_audio)
+        print(f"[STAGE 2 WARNING] Multi-clip audio mix failed ({e}). Using first available segment.")
+        if os.path.exists(valid_clips[0][0]):
+            os.rename(valid_clips[0][0], output_final_audio)
 
 def render_hyperframes():
     print("[STAGE 2] Executing Render Engine...")
@@ -73,9 +89,14 @@ def render_hyperframes():
         subprocess.run(ffmpeg_cmd, check=True)
         print("[STAGE 2] Video stitched successfully: final_reel.mp4")
     else:
-        print("[STAGE 2 WARNING] No custom images found. Attempting HyperFrames CLI render...")
-        cmd = "npx hyperframes render template.html --audio final_synced_vo.mp3 -o final_reel.mp4"
-        subprocess.run(cmd, shell=True, check=True)
+        print("[STAGE 2 WARNING] No custom images found. Running default video pipeline...")
+        # Create a basic blank video with the audio if no images exist
+        ffmpeg_cmd = [
+            "ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=black:s=1080x1920:r=30",
+            "-i", "final_synced_vo.mp3", "-c:v", "libx264", "-c:a", "aac",
+            "-shortest", "final_reel.mp4"
+        ]
+        subprocess.run(ffmpeg_cmd, check=True)
 
 def dispatch_to_telegram():
     raw_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
